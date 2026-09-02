@@ -144,6 +144,43 @@ privileges and extension availability (source extensions must be installable
 on the target), so a misconfigured target fails fast with a clear error
 instead of stalling inside `pg_restore`.
 
+### Large single tables (`--split-tables-larger-than`)
+
+`pg_dump --jobs` parallelises across archive *entries*, and a table is one
+entry — so a single 300 GB table dumps on one worker no matter how high
+`--jobs` goes. Worse, when the migrator runs on a third host the rows cross
+the network twice: once into the archive, once back out to the target.
+(`pg_dump`'s compression does not help here; it happens on the migrator,
+after the bytes have already arrived.)
+
+```bash
+pg_dbmigrator --mode offline \
+    --source '…' --target '…' --jobs 8 \
+    --split-tables-larger-than 50GB   # off unless you pass it
+```
+
+Tables at or above the threshold keep their `CREATE TABLE` in the archive
+but have their rows excluded (`pg_dump --exclude-table-data`) and streamed
+straight from source to target instead, as `--split-max-parts` concurrent
+`ctid`-range `COPY` streams (default 4). Every stream reads the same
+exported snapshot, so the result is consistent with the rest of the dump.
+
+Because the split planner reads the source catalog directly rather than
+reimplementing `pg_dump`'s pattern grammar, and because an exported
+snapshot does not outlive the process that took it, the option **refuses**
+rather than silently degrading when combined with:
+
+| Combination | Why it is refused |
+|---|---|
+| `--schema` / `--table` / `--exclude-schema` / `--exclude-table` | The planner and `pg_dump` could disagree about which tables are in scope, excluding a table's data from the archive while not copying it directly (or the reverse). |
+| `--resume` | A resumed run cannot re-acquire the snapshot the archive was taken at, and re-deriving the plan could skip a table that has since dropped below the threshold — after its data was already excluded from the archive. |
+| `--no-split-sections` | The copy has to land between the data and post-data sections. After an all-in-one restore the target already has indexes, foreign keys and triggers, and `TRUNCATE` fails outright on an FK-referenced table. |
+| `--dump-scope schema-only` | There is no data to move. |
+
+The copy also refuses to truncate a target table that already holds rows
+unless `--drop-target-first` is passed, so a mistargeted run stops instead
+of overwriting data it did not create.
+
 ### Online
 
 On the source, before starting:
@@ -325,6 +362,18 @@ See [BENCHMARK.md](BENCHMARK.md) for migration performance results across 10 GB 
 
 ## Known limitations
 
+* **Object ownership and ACLs are not migrated.** The restore runs with
+  `--no-owner --no-acl`, so every restored object ends up owned by the
+  role in `--target` and all `GRANT`s are dropped. Roles themselves are
+  not copied either (there is no `pg_dumpall --globals-only` step). This
+  is deliberate — the target's permission model is assumed to be managed
+  separately — but it means a migrated database is *not* a permissions
+  replica of the source. Re-apply ownership and grants after cutover.
+* **Online mode requires `idle_in_transaction_session_timeout = 0` on the
+  source.** The connection that exports the snapshot stays idle inside a
+  transaction for the entire `pg_dump`; a non-zero timeout terminates it
+  part-way through and fails the migration. Preflight refuses to start
+  when the setting is non-zero. Offline mode is unaffected.
 * Apply runs through PostgreSQL's own logical replication apply worker
   (`CREATE SUBSCRIPTION`), not an in-process decoder, so type fidelity
   matches native logical replication. The flip side is that no

@@ -40,6 +40,9 @@ pub(crate) trait PreflightProbe: Send + Sync {
     async fn target_role_privilege_info(&self, conn: &str) -> Result<TargetRolePrivInfo>;
     async fn is_in_recovery(&self, conn: &str) -> Result<bool>;
     async fn subscription_capacity_gucs(&self, conn: &str) -> Result<(i64, i64, i64)>;
+    /// Return the source's `idle_in_transaction_session_timeout` in
+    /// milliseconds (0 means disabled).
+    async fn idle_in_transaction_timeout_ms(&self, conn: &str) -> Result<i64>;
     /// Return `(source_installed, target_available)`: the extension names
     /// installed on the source (`pg_extension`) and the extension names
     /// available for installation on the target (`pg_available_extensions`).
@@ -161,6 +164,21 @@ impl PreflightProbe for PgProbe {
         let b: i32 = row.get(1);
         let c: i32 = row.get(2);
         Ok((a as i64, b as i64, c as i64))
+    }
+
+    async fn idle_in_transaction_timeout_ms(&self, conn: &str) -> Result<i64> {
+        let client = connect_with_sslmode(conn).await?;
+        // `pg_settings.setting` is the raw value in the GUC's base unit (ms
+        // here). `current_setting()` would return a display string like
+        // "10min", which does not cast to an integer.
+        let row = client
+            .query_one(
+                "SELECT setting::bigint FROM pg_settings \
+                 WHERE name = 'idle_in_transaction_session_timeout'",
+                &[],
+            )
+            .await?;
+        Ok(row.get(0))
     }
 
     async fn installed_and_available_extensions(
@@ -975,6 +993,58 @@ pub(crate) async fn verify_target_not_in_recovery_with_probe<P: PreflightProbe +
     Ok(())
 }
 
+/// Pure decision: can a snapshot survive an entire `pg_dump` on a source
+/// with this `idle_in_transaction_session_timeout`?
+///
+/// It cannot. The connection that runs `CREATE_REPLICATION_SLOT ...
+/// EXPORT_SNAPSHOT` must stay open for the whole dump to keep the exported
+/// snapshot alive, and it is genuinely idle-in-transaction that entire
+/// time — `START_REPLICATION` is deliberately deferred until after the
+/// dump. PostgreSQL terminates it with `FATAL: terminating connection due
+/// to idle-in-transaction timeout`, and the dump then fails against a dead
+/// snapshot, typically hours in.
+///
+/// The GUC cannot be overridden from our side: `pg_walstream` parses the
+/// conninfo itself and ignores libpq's `options`, so there is no way to
+/// push a session setting down onto that connection. Failing here, before
+/// any work happens, is the only thing left.
+pub(crate) fn classify_snapshot_timeout(idle_timeout_ms: i64) -> Result<()> {
+    if idle_timeout_ms == 0 {
+        return Ok(());
+    }
+    Err(MigrationError::config(format!(
+        "the source has idle_in_transaction_session_timeout={idle_timeout_ms}ms, which will \
+         terminate the connection holding the exported snapshot part-way through pg_dump and \
+         fail the migration. Disable it for the migration role \
+         (`ALTER ROLE <user> SET idle_in_transaction_session_timeout = 0;`) or server-wide \
+         (`ALTER SYSTEM SET idle_in_transaction_session_timeout = 0; SELECT pg_reload_conf();`). \
+         Offline mode without --split-tables-larger-than takes no exported snapshot and is \
+         unaffected."
+    )))
+}
+
+/// Check that the source will not kill the snapshot-holding connection
+/// mid-dump.
+///
+/// Always run for online mode, which holds the replication slot's exported
+/// snapshot across the dump. Also run for offline mode when
+/// `--split-tables-larger-than` is set, because the split copy exports its
+/// own snapshot and holds it just as long.
+pub async fn verify_source_snapshot_timeouts(source_conn: &str) -> Result<()> {
+    verify_source_snapshot_timeouts_with_probe(&PgProbe, source_conn).await
+}
+
+/// Probe-based variant of [`verify_source_snapshot_timeouts`].
+pub(crate) async fn verify_source_snapshot_timeouts_with_probe<P: PreflightProbe + ?Sized>(
+    probe: &P,
+    source_conn: &str,
+) -> Result<()> {
+    let idle_ms = probe.idle_in_transaction_timeout_ms(source_conn).await?;
+    classify_snapshot_timeout(idle_ms)?;
+    info!("source idle_in_transaction_session_timeout is disabled; snapshot can outlive pg_dump");
+    Ok(())
+}
+
 /// Minimum acceptable target-side subscription-related GUC values. These
 /// are the absolute floor required for `CREATE SUBSCRIPTION` to function
 /// at all — one logical-replication worker and two worker-process slots.
@@ -1144,6 +1214,11 @@ impl PreflightReport {
 /// Static list of check names for the offline bundle, in order. Exposed so
 /// callers/tests can assert bundle composition without running the bundle.
 ///
+/// One check is conditional and therefore absent here: when
+/// `--split-tables-larger-than` is set, the offline bundle additionally runs
+/// `source_snapshot_timeouts`, because the split copy exports a snapshot the
+/// plain offline path never takes.
+///
 /// Ordering invariant: every check that opens a connection to the *target
 /// database itself* (as opposed to the maintenance `postgres` DB) must run
 /// after `target_db_exists`, since the target DB may not yet exist on a
@@ -1168,6 +1243,7 @@ pub fn online_preflight_check_names() -> &'static [&'static str] {
         "pg_tools",
         "version_compat",
         "source_repl_role",
+        "source_snapshot_timeouts",
         "target_not_in_recovery",
         "target_db_exists",
         "target_role_privs",
@@ -1205,6 +1281,14 @@ pub async fn run_offline_preflight(
     verify_target_role_privileges(&cfg.target.connection_string, MigrationMode::Offline).await?;
     report.record("target_role_privs", PreflightOutcome::Pass);
 
+    // Only relevant when the split copy is on: that path exports its own
+    // snapshot and holds it idle-in-transaction for the whole dump and
+    // restore, exactly like the online slot connection does.
+    if cfg.split_tables_larger_than.is_some() {
+        verify_source_snapshot_timeouts(&cfg.source.connection_string).await?;
+        report.record("source_snapshot_timeouts", PreflightOutcome::Pass);
+    }
+
     let ext_outcome = resolve_extension_preflight(
         verify_target_extensions_available(
             &cfg.source.connection_string,
@@ -1231,6 +1315,12 @@ pub async fn run_online_preflight(cfg: &crate::config::MigrationConfig) -> Resul
 
     verify_source_replication_role(&cfg.source.connection_string).await?;
     report.record("source_repl_role", PreflightOutcome::Pass);
+
+    // Must run before the dump: an idle-in-transaction timeout on the source
+    // kills the snapshot holder part-way through pg_dump, so catching it here
+    // saves the operator hours of work that is already doomed.
+    verify_source_snapshot_timeouts(&cfg.source.connection_string).await?;
+    report.record("source_snapshot_timeouts", PreflightOutcome::Pass);
 
     // target_not_in_recovery uses the maintenance DB; safe before target_db_exists.
     verify_target_not_in_recovery(&cfg.target.connection_string).await?;
@@ -1972,6 +2062,7 @@ mod tests {
                 "pg_tools",
                 "version_compat",
                 "source_repl_role",
+                "source_snapshot_timeouts",
                 "target_not_in_recovery",
                 "target_db_exists",
                 "target_role_privs",
@@ -2050,6 +2141,7 @@ mod tests {
         in_recovery: Option<bool>,
         sub_capacity: Option<(i64, i64, i64)>,
         extensions: Option<(Vec<String>, Vec<String>)>,
+        idle_timeout_ms: Option<i64>,
     }
 
     impl MockProbe {
@@ -2092,6 +2184,9 @@ mod tests {
         }
         async fn subscription_capacity_gucs(&self, _conn: &str) -> Result<(i64, i64, i64)> {
             Ok(self.sub_capacity.expect("sub_capacity not stubbed"))
+        }
+        async fn idle_in_transaction_timeout_ms(&self, _conn: &str) -> Result<i64> {
+            Ok(self.idle_timeout_ms.expect("idle_timeout_ms not stubbed"))
         }
         async fn installed_and_available_extensions(
             &self,
@@ -2438,5 +2533,61 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(format!("{err}").contains("timescaledb"), "err: {err}");
+    }
+
+    #[test]
+    fn classify_snapshot_timeout_accepts_disabled() {
+        assert!(classify_snapshot_timeout(0).is_ok());
+    }
+
+    #[test]
+    fn classify_snapshot_timeout_rejects_any_non_zero() {
+        // Even a generous timeout is rejected: the snapshot connection is
+        // idle for the whole dump, and we cannot know the dump's duration
+        // up front.
+        for ms in [1, 60_000, 3_600_000] {
+            let err = classify_snapshot_timeout(ms).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&ms.to_string()),
+                "err should name the value: {msg}"
+            );
+            assert!(
+                msg.contains("ALTER ROLE"),
+                "err should be actionable: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_source_snapshot_timeouts_passes_when_disabled() {
+        let probe = MockProbe {
+            idle_timeout_ms: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            verify_source_snapshot_timeouts_with_probe(&probe, "src://source")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_source_snapshot_timeouts_fails_when_set() {
+        let probe = MockProbe {
+            idle_timeout_ms: Some(600_000),
+            ..Default::default()
+        };
+        let err = verify_source_snapshot_timeouts_with_probe(&probe, "src://source")
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("600000"), "err: {err}");
+    }
+
+    #[test]
+    fn online_bundle_includes_snapshot_timeout_check() {
+        assert!(online_preflight_check_names().contains(&"source_snapshot_timeouts"));
+        // Offline takes no snapshot, so the check must not appear there.
+        assert!(!offline_preflight_check_names().contains(&"source_snapshot_timeouts"));
     }
 }

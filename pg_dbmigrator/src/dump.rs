@@ -44,6 +44,14 @@ pub struct DumpRequest {
     pub exclude_schemas: Vec<String>,
     /// Tables to **exclude** (`--exclude-table=...`).
     pub exclude_tables: Vec<String>,
+    /// Tables whose *definition* is dumped but whose rows are not
+    /// (`--exclude-table-data=...`).
+    ///
+    /// Used by [`crate::copy_split`]: a table too large for `pg_dump`'s
+    /// per-entry parallelism keeps its `CREATE TABLE` in the archive, so
+    /// the pre-data restore still creates it, while its rows travel
+    /// straight from source to target instead of through the archive.
+    pub exclude_table_data: Vec<String>,
     /// Where to write the dump archive.
     pub output_path: PathBuf,
     /// Output format. Defaults to [`DumpFormat::Custom`].
@@ -153,6 +161,10 @@ pub fn build_pg_dump_args(req: &DumpRequest) -> Vec<String> {
 
     for t in &req.exclude_tables {
         args.push(format!("--exclude-table={t}"));
+    }
+
+    for t in &req.exclude_table_data {
+        args.push(format!("--exclude-table-data={t}"));
     }
 
     if req.no_publications {
@@ -410,6 +422,7 @@ mod tests {
     fn base_request() -> DumpRequest {
         DumpRequest {
             source: sample_endpoint(),
+            exclude_table_data: Vec::new(),
             scope: DumpScope::All,
             jobs: 4,
             snapshot: None,

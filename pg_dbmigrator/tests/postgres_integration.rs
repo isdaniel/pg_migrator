@@ -1839,3 +1839,268 @@ async fn migrator_offline_run_covers_auto_verify() {
             .ok();
     }
 }
+
+/// The snapshot-timeout preflight reads the GUC over a real connection.
+/// A unit test cannot catch a bad query here because the probe is mocked,
+/// and the first version of this check used `current_setting()`, which
+/// returns a display string ("10min") that does not cast to an integer.
+#[tokio::test]
+async fn snapshot_timeout_preflight_reads_guc_in_milliseconds() {
+    let url = skip_without_pg!(source_url());
+    let client = connect_with_sslmode(&url).await.unwrap();
+
+    // Session-local so the test never mutates the shared container.
+    client
+        .batch_execute("SET idle_in_transaction_session_timeout = '10min'")
+        .await
+        .unwrap();
+    let row = client
+        .query_one(
+            "SELECT setting::bigint FROM pg_settings \
+             WHERE name = 'idle_in_transaction_session_timeout'",
+            &[],
+        )
+        .await
+        .expect("the preflight query must run against a real server");
+    let ms: i64 = row.get(0);
+    assert_eq!(ms, 600_000, "pg_settings must report the raw ms value");
+
+    // And the real check rejects exactly that.
+    client
+        .batch_execute("SET idle_in_transaction_session_timeout = 0")
+        .await
+        .unwrap();
+    assert!(
+        pg_dbmigrator::preflight::verify_source_snapshot_timeouts(&url)
+            .await
+            .is_ok(),
+        "a source with the timeout disabled must pass preflight"
+    );
+}
+
+/// End-to-end split copy against live databases.
+///
+/// The fixture is deliberately hostile, because both of the bugs this
+/// exercises were real:
+///
+/// * `decoy.split_events` shares its table name with `split_src.split_events`.
+///   An earlier version named tables with `oid::regclass::text`, which drops
+///   the schema whenever the relation is visible through the session's
+///   `search_path` — so the bare name could resolve to the *decoy* on the
+///   target and truncate it.
+/// * `split_src.split_gen` has a `GENERATED ALWAYS AS … STORED` column.
+///   `SELECT *` includes it while `COPY t FROM STDIN` without a column list
+///   excludes it, so the default spellings disagree and the copy fails with
+///   "extra data after last expected column".
+#[tokio::test]
+async fn split_copy_moves_rows_without_touching_same_named_tables() {
+    let src_url = skip_without_pg!(source_url());
+    let tgt_url = skip_without_pg!(target_url());
+    let source = connect_with_sslmode(&src_url).await.unwrap();
+    let target = connect_with_sslmode(&tgt_url).await.unwrap();
+
+    for c in [&source, &target] {
+        c.batch_execute(
+            "DROP SCHEMA IF EXISTS split_src CASCADE; DROP SCHEMA IF EXISTS decoy CASCADE;",
+        )
+        .await
+        .unwrap();
+    }
+    source
+        .batch_execute(
+            "CREATE SCHEMA split_src; \
+             CREATE SCHEMA decoy; \
+             CREATE TABLE split_src.split_events AS \
+               SELECT i AS id, md5(i::text) AS payload FROM generate_series(1, 5000) i; \
+             CREATE TABLE split_src.split_gen (a int, c text, \
+               b int GENERATED ALWAYS AS (a * 2) STORED); \
+             INSERT INTO split_src.split_gen (a, c) \
+               SELECT i, md5(i::text) FROM generate_series(1, 5000) i; \
+             CREATE TABLE decoy.split_events (id int, payload text);",
+        )
+        .await
+        .unwrap();
+    // Same-named decoy on the TARGET, holding rows that must survive.
+    target
+        .batch_execute(
+            "CREATE SCHEMA split_src; \
+             CREATE SCHEMA decoy; \
+             CREATE TABLE split_src.split_events (id int, payload text); \
+             CREATE TABLE split_src.split_gen (a int, c text, \
+               b int GENERATED ALWAYS AS (a * 2) STORED); \
+             CREATE TABLE decoy.split_events (id int, payload text); \
+             INSERT INTO decoy.split_events VALUES (1, 'DO NOT TOUCH');",
+        )
+        .await
+        .unwrap();
+
+    // Threshold 0 would be rejected by config validation, so plan directly
+    // with a 1-byte threshold to pick up these small fixtures.
+    let plan = pg_dbmigrator::copy_split::plan_split_tables(&src_url, 1, 2)
+        .await
+        .expect("planning must succeed");
+    let names: Vec<&str> = plan.iter().map(|t| t.table.as_str()).collect();
+    assert!(
+        names.contains(&"split_src.split_events"),
+        "plan must carry schema-qualified names, got {names:?}"
+    );
+    assert!(
+        plan.iter()
+            .find(|t| t.table == "split_src.split_gen")
+            .expect("split_gen must be planned")
+            .columns
+            .iter()
+            .all(|c| c != "b"),
+        "generated column must be excluded from the copy column list"
+    );
+
+    let snapshot = pg_dbmigrator::copy_split::export_snapshot(&src_url)
+        .await
+        .unwrap();
+    let planned: Vec<_> = plan
+        .into_iter()
+        .filter(|t| t.table.starts_with("split_src."))
+        .collect();
+    let rows = pg_dbmigrator::copy_split::run_split_copy(
+        &src_url,
+        &tgt_url,
+        &snapshot.id,
+        &planned,
+        false,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("split copy must succeed");
+    assert_eq!(rows, 10_000, "both fixtures should be copied in full");
+
+    let check = |sql: &'static str| {
+        let target = &target;
+        async move { target.query_one(sql, &[]).await.unwrap().get::<_, i64>(0) }
+    };
+    assert_eq!(
+        check("SELECT count(*) FROM split_src.split_events").await,
+        5000
+    );
+    assert_eq!(
+        check("SELECT count(*) FROM split_src.split_gen").await,
+        5000
+    );
+    assert_eq!(
+        check("SELECT count(*) FROM split_src.split_gen WHERE b = a * 2").await,
+        5000,
+        "generated column must be recomputed on the target"
+    );
+
+    // The decoy must be untouched — this is the data-destruction regression.
+    let survivor: String = target
+        .query_one("SELECT payload FROM decoy.split_events", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(survivor, "DO NOT TOUCH");
+
+    // A second run onto a now-populated target must refuse rather than wipe it.
+    let err = pg_dbmigrator::copy_split::run_split_copy(
+        &src_url,
+        &tgt_url,
+        &snapshot.id,
+        &planned,
+        false,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect_err("a non-empty target must not be truncated implicitly");
+    assert!(
+        format!("{err}").contains("already contains rows"),
+        "unexpected error: {err}"
+    );
+
+    for c in [&source, &target] {
+        c.batch_execute(
+            "DROP SCHEMA IF EXISTS split_src CASCADE; DROP SCHEMA IF EXISTS decoy CASCADE;",
+        )
+        .await
+        .ok();
+    }
+}
+
+/// Drive a whole offline migration through `Migrator` with the split copy
+/// enabled, so the orchestrator wiring — plan, `--exclude-table-data`, the
+/// copy stage between the data and post-data sections — is exercised as a
+/// unit rather than piecemeal.
+#[tokio::test]
+async fn offline_migration_with_split_copy_moves_everything() {
+    let src_url = skip_without_pg!(source_url());
+    let tgt_url = skip_without_pg!(target_url());
+    let source = connect_with_sslmode(&src_url).await.unwrap();
+    let target = connect_with_sslmode(&tgt_url).await.unwrap();
+
+    // `big` clears the threshold and takes the direct path; `small` stays in
+    // the archive. Both must arrive.
+    for c in [&source, &target] {
+        c.batch_execute("DROP SCHEMA IF EXISTS split_e2e CASCADE")
+            .await
+            .ok();
+    }
+    source
+        .batch_execute(
+            "CREATE SCHEMA split_e2e; \
+             CREATE TABLE split_e2e.big AS \
+               SELECT i AS id, repeat(md5(i::text), 4) AS payload \
+               FROM generate_series(1, 60000) i; \
+             ALTER TABLE split_e2e.big ADD PRIMARY KEY (id); \
+             CREATE INDEX big_payload_idx ON split_e2e.big (payload); \
+             CREATE TABLE split_e2e.small AS SELECT i AS id FROM generate_series(1, 25) i;",
+        )
+        .await
+        .unwrap();
+
+    let cfg = MigrationConfig {
+        mode: MigrationMode::Offline,
+        source: EndpointConfig::parse(&src_url).unwrap(),
+        target: EndpointConfig::parse(&tgt_url).unwrap(),
+        jobs: 2,
+        skip_analyze: true,
+        skip_source_vacuum: true,
+        verify: pg_dbmigrator::VerifyMode::Strict,
+        // Comfortably below `big` and above `small`.
+        split_tables_larger_than: Some(1024 * 1024),
+        split_max_parts: 3,
+        dump_path: Some(std::env::temp_dir().join(format!("split_e2e_{}", std::process::id()))),
+        ..MigrationConfig::default()
+    };
+    let outcome = pg_dbmigrator::Migrator::new(cfg)
+        .run(tokio_util::sync::CancellationToken::new())
+        .await;
+    assert!(outcome.is_ok(), "split-copy migration failed: {outcome:?}");
+
+    let count = |sql: &'static str| {
+        let target = &target;
+        async move { target.query_one(sql, &[]).await.unwrap().get::<_, i64>(0) }
+    };
+    assert_eq!(count("SELECT count(*) FROM split_e2e.big").await, 60000);
+    assert_eq!(count("SELECT count(*) FROM split_e2e.small").await, 25);
+    // post-data still ran over the directly-copied table.
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM pg_indexes \
+             WHERE schemaname = 'split_e2e' AND tablename = 'big'"
+        )
+        .await,
+        2,
+        "primary key and secondary index must both be rebuilt"
+    );
+    // And the rows are the source's, not a truncated subset.
+    let src_sum: i64 = source
+        .query_one("SELECT sum(id) FROM split_e2e.big", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count("SELECT sum(id) FROM split_e2e.big").await, src_sum);
+
+    for c in [&source, &target] {
+        c.batch_execute("DROP SCHEMA IF EXISTS split_e2e CASCADE")
+            .await
+            .ok();
+    }
+}

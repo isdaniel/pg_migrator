@@ -40,6 +40,7 @@
 
 pub mod analyze;
 pub mod config;
+pub mod copy_split;
 pub mod cutover;
 pub mod dump;
 pub mod error;

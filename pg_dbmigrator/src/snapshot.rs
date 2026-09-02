@@ -74,7 +74,7 @@ pub async fn prepare_replication_slot(
     info!(slot = %opts.slot_name, publication = %opts.publication, "preparing replication slot");
     opts.validate()?;
 
-    let conn = ensure_replication_qs(connection_string);
+    let conn = with_snapshot_keepalives(&ensure_replication_qs(connection_string));
     let cfg = build_stream_config(opts);
     let mut stream = LogicalReplicationStream::new(&conn, cfg).await?;
     stream.ensure_replication_slot().await?;
@@ -107,6 +107,48 @@ pub fn ensure_replication_qs(connection_string: &str) -> String {
 /// Bound used by the orchestrator when waiting for the slot to be ready.
 /// Kept here so tests do not need to depend on real timings.
 pub const DEFAULT_SLOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// TCP keepalive probes for connections that hold a snapshot open.
+///
+/// Restricted to the three keys **both** connection-string parsers in this
+/// workspace accept. `pg_walstream` has its own conninfo parser
+/// (`connection/native/conninfo.rs`) that knows `keepalives_count` but not
+/// `keepalives_retries`; `tokio-postgres` is the reverse
+/// (`config.rs:646-673`), and rejects the whole string with "invalid
+/// connection string" on an unknown key. Naming either spelling here makes
+/// the result valid for exactly one of the two callers, so neither is named
+/// and each parser applies its own retry-count default.
+///
+/// Note also that `pg_walstream` silently *ignores* conninfo keys it does
+/// not know — including libpq's `options` — so session GUCs cannot be
+/// pushed down this way. The source-side
+/// `idle_in_transaction_session_timeout` is checked in
+/// [`crate::preflight::verify_source_snapshot_timeouts`] instead.
+const SNAPSHOT_KEEPALIVE_PARAMS: &str = "keepalives=1&keepalives_idle=60&keepalives_interval=10";
+
+/// Turn on TCP keepalives for the connection that creates the replication
+/// slot.
+///
+/// This connection holds the exported snapshot open for the *entire*
+/// `pg_dump` — minutes on a small database, hours on a large one — and it
+/// sits idle the whole time. Without keepalives a silently dropped peer
+/// (NAT timeout, firewall, load balancer) is not noticed until the OS
+/// default expires, typically two hours, by which point the dump has
+/// already failed against a dead snapshot.
+///
+/// Caller-supplied values win: if the connection string already mentions
+/// `keepalives`, it is left untouched.
+pub fn with_snapshot_keepalives(connection_string: &str) -> String {
+    if connection_string.contains("keepalives") {
+        return connection_string.to_string();
+    }
+    let sep = if connection_string.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    format!("{connection_string}{sep}{SNAPSHOT_KEEPALIVE_PARAMS}")
+}
 
 #[cfg(test)]
 mod tests {
@@ -175,5 +217,64 @@ mod tests {
     #[test]
     fn default_slot_timeout_is_60_seconds() {
         assert_eq!(DEFAULT_SLOT_TIMEOUT, std::time::Duration::from_secs(60));
+    }
+
+    /// `pg_walstream` parses the conninfo itself and recognises these keys,
+    /// so assert the exact spelling rather than just "something was added".
+    #[test]
+    fn with_snapshot_keepalives_appends_recognised_keys() {
+        let out = with_snapshot_keepalives("postgresql://u:p@h:5432/db?replication=database");
+        assert!(out.starts_with("postgresql://u:p@h:5432/db?replication=database&"));
+        for key in [
+            "keepalives=1",
+            "keepalives_idle=60",
+            "keepalives_interval=10",
+        ] {
+            assert!(out.contains(key), "missing {key} in {out}");
+        }
+    }
+
+    #[test]
+    fn with_snapshot_keepalives_uses_question_mark_when_no_query() {
+        let out = with_snapshot_keepalives("postgresql://u@h/db");
+        assert_eq!(
+            out,
+            format!("postgresql://u@h/db?{SNAPSHOT_KEEPALIVE_PARAMS}")
+        );
+    }
+
+    /// `copy_split::export_snapshot` feeds this string to `tokio-postgres`
+    /// while `prepare_replication_slot` feeds it to `pg_walstream`'s own
+    /// parser. The two accept different retry-count keys and tokio-postgres
+    /// rejects the *entire* string on an unknown one, so the shared value
+    /// must stay inside the intersection. Asserting the parse is the only
+    /// thing that catches a drift here.
+    #[test]
+    fn with_snapshot_keepalives_is_accepted_by_tokio_postgres() {
+        let out = with_snapshot_keepalives("postgresql://u:p@h:5432/db");
+        let cfg: tokio_postgres::Config = out
+            .parse()
+            .unwrap_or_else(|e| panic!("tokio-postgres rejected {out:?}: {e}"));
+        assert!(cfg.get_keepalives());
+        assert_eq!(
+            cfg.get_keepalives_idle(),
+            std::time::Duration::from_secs(60)
+        );
+        assert!(
+            !out.contains("keepalives_count") && !out.contains("keepalives_retries"),
+            "retry-count key is parser-specific and must be omitted: {out}"
+        );
+    }
+
+    #[test]
+    fn with_snapshot_keepalives_keeps_caller_supplied_values() {
+        let given = "postgresql://u@h/db?keepalives=0";
+        assert_eq!(with_snapshot_keepalives(given), given);
+    }
+
+    #[test]
+    fn with_snapshot_keepalives_is_idempotent() {
+        let once = with_snapshot_keepalives("postgresql://u@h/db?replication=database");
+        assert_eq!(with_snapshot_keepalives(&once), once);
     }
 }

@@ -189,6 +189,23 @@ pub struct Cli {
     #[arg(long)]
     pub no_split_sections: bool,
 
+    /// Copy tables at or above this size directly from source to target,
+    /// bypassing the dump archive. Accepts `50GB`, `512MB`, `1024`, ...
+    ///
+    /// `pg_dump --jobs` parallelises per table, so one huge table always
+    /// dumps on a single worker — and its bytes cross the network twice,
+    /// into the archive and back out. Tables over this size are excluded
+    /// from the archive and streamed directly in parallel `COPY` ranges
+    /// instead. Off by default; unset means the previous behaviour.
+    #[arg(long, value_name = "SIZE")]
+    pub split_tables_larger_than: Option<String>,
+
+    /// Concurrent COPY streams per split table (default 4). Measured
+    /// throughput flattens around four — the target's write path saturates
+    /// well before its CPU does.
+    #[arg(long, default_value_t = 4, value_name = "N")]
+    pub split_max_parts: usize,
+
     /// `pg_dump` compression spec passed to `--compress`. Examples:
     /// `gzip:6`, `zstd:3`, `lz4`, `none`. These `<algorithm>[:level]` forms
     /// (including `none`) need `pg_dump` 16+; PG ≤ 15 clients accept only a
@@ -361,6 +378,12 @@ impl Cli {
             no_publications: !self.keep_publications,
             no_subscriptions: !self.keep_subscriptions,
             split_sections: self.split_sections && !self.no_split_sections,
+            split_tables_larger_than: self
+                .split_tables_larger_than
+                .as_deref()
+                .map(pg_dbmigrator::copy_split::parse_size)
+                .transpose()?,
+            split_max_parts: self.split_max_parts,
             resume: self.resume,
             resume_file: self.resume_file,
             dump_path: self.dump_path,

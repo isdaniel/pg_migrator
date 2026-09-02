@@ -69,6 +69,25 @@ pub struct MigrationConfig {
     /// dump (i.e. not [`crate::dump::DumpFormat::Plain`]). Default `true`.
     #[serde(default = "default_true")]
     pub split_sections: bool,
+    /// Move tables at or above this many bytes with a direct parallel
+    /// source → target `COPY` instead of routing them through the dump
+    /// archive. `None` (the default) disables the feature entirely, and the
+    /// dump/restore path behaves exactly as it did before.
+    ///
+    /// `pg_dump --jobs` parallelises across archive entries, and a table is
+    /// one entry, so a single huge table is always dumped by one worker —
+    /// and its bytes cross the network twice, once into the migrator's
+    /// archive and once back out to the target. Tables selected here are
+    /// excluded from the archive (`--exclude-table-data`) and streamed
+    /// directly instead. See [`crate::copy_split`].
+    #[serde(default)]
+    pub split_tables_larger_than: Option<u64>,
+    /// Concurrent `COPY` streams per split table. Default 4: measured
+    /// throughput flattened there (four streams landed within 1 % of
+    /// eight) because the target's write path saturates long before its
+    /// CPU does, so extra streams mostly buy contention.
+    #[serde(default = "default_split_max_parts")]
+    pub split_max_parts: usize,
     /// Optional `--compress=<spec>` value forwarded to `pg_dump`. PG 16+
     /// accepts `gzip:N`, `lz4:N`, `zstd:N`, or `none`; older versions
     /// accept `0..=9`. Trades a small amount of source-side CPU for a 3–10×
@@ -167,6 +186,12 @@ fn default_compress() -> Option<String> {
     Some("lz4:1".into())
 }
 
+/// Concurrent `COPY` streams per split table. See
+/// [`MigrationConfig::split_max_parts`] for why the number is this low.
+fn default_split_max_parts() -> usize {
+    4
+}
+
 /// Pick a sensible default for `pg_dump --jobs` / `pg_restore --jobs`.
 ///
 /// We use the host's logical CPU count (typically a good proxy for the
@@ -200,6 +225,8 @@ impl Default for MigrationConfig {
             no_publications: true,
             no_subscriptions: true,
             split_sections: true,
+            split_tables_larger_than: None,
+            split_max_parts: default_split_max_parts(),
             dump_compress: default_compress(),
             no_sync: true,
             no_comments: true,
@@ -237,6 +264,72 @@ impl MigrationConfig {
         }
         if self.mode == MigrationMode::Online {
             self.online.validate()?;
+        }
+        self.validate_split_copy()?;
+        Ok(())
+    }
+
+    /// Reject the split-copy combinations that cannot be made correct.
+    ///
+    /// Each of these is a refusal rather than a silent degradation because
+    /// the failure mode is data loss or data destruction, not slowness.
+    fn validate_split_copy(&self) -> Result<()> {
+        let Some(threshold) = self.split_tables_larger_than else {
+            return Ok(());
+        };
+        if threshold == 0 {
+            return Err(MigrationError::config(
+                "--split-tables-larger-than must be > 0; a zero threshold would route every \
+                 table in the database through the split copy",
+            ));
+        }
+        if self.split_max_parts == 0 {
+            return Err(MigrationError::config("--split-max-parts must be >= 1"));
+        }
+        if self.dump_scope == DumpScope::SchemaOnly {
+            return Err(MigrationError::config(
+                "--split-tables-larger-than moves table data and cannot be combined with a \
+                 schema-only dump",
+            ));
+        }
+        // The planner queries the source catalog directly and does not
+        // reimplement pg_dump's pattern matching, so the two would disagree
+        // about which tables are in scope — excluding a table's data from
+        // the archive while still copying it directly, or the reverse.
+        if !self.schemas.is_empty()
+            || !self.tables.is_empty()
+            || !self.exclude_schemas.is_empty()
+            || !self.exclude_tables.is_empty()
+        {
+            return Err(MigrationError::config(
+                "--split-tables-larger-than cannot yet be combined with --schema / --table / \
+                 --exclude-schema / --exclude-table: the split planner does not implement \
+                 pg_dump's pattern matching, so the two would disagree about which tables are \
+                 in scope",
+            ));
+        }
+        // An exported snapshot dies with the process that exported it, so a
+        // resumed run cannot read the split tables at the same instant as
+        // the archive it is resuming into. Re-deriving the plan is worse
+        // still: a table that has since dropped below the threshold had its
+        // data excluded from the archive and would never be copied at all.
+        if self.resume {
+            return Err(MigrationError::config(
+                "--split-tables-larger-than cannot be combined with --resume: the exported \
+                 snapshot the direct copy reads from does not survive a restart, so a resumed \
+                 run cannot stay consistent with the archive it is resuming into",
+            ));
+        }
+        // The all-in-one restore has already built indexes, foreign keys and
+        // triggers by the time the copy would run, so the copy would fire
+        // triggers pg_restore would not and TRUNCATE would fail outright on
+        // an FK-referenced table.
+        if !self.split_sections {
+            return Err(MigrationError::config(
+                "--split-tables-larger-than requires split-section restore; remove \
+                 --no-split-sections. The direct copy has to land between the data and \
+                 post-data sections, before indexes and foreign keys exist",
+            ));
         }
         Ok(())
     }
@@ -1049,5 +1142,92 @@ mod tests {
         let cfg2: MigrationConfig = serde_json::from_value(json).unwrap();
         assert!(!cfg2.skip_analyze);
         assert!(!cfg2.skip_source_vacuum);
+    }
+}
+
+#[cfg(test)]
+mod split_copy_validation_tests {
+    use super::*;
+
+    fn split_cfg() -> MigrationConfig {
+        MigrationConfig {
+            source: EndpointConfig::parse("postgres://u:p@src/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u:p@dst/db").unwrap(),
+            split_tables_larger_than: Some(1024),
+            ..MigrationConfig::default()
+        }
+    }
+
+    #[test]
+    fn split_copy_off_by_default_and_validates_clean() {
+        let cfg = MigrationConfig {
+            source: EndpointConfig::parse("postgres://u:p@src/db").unwrap(),
+            target: EndpointConfig::parse("postgres://u:p@dst/db").unwrap(),
+            ..MigrationConfig::default()
+        };
+        assert!(cfg.split_tables_larger_than.is_none());
+        assert!(cfg.validate().is_ok());
+        assert!(split_cfg().validate().is_ok());
+    }
+
+    #[test]
+    fn split_copy_rejects_zero_threshold_and_zero_parts() {
+        let mut cfg = split_cfg();
+        cfg.split_tables_larger_than = Some(0);
+        assert!(format!("{}", cfg.validate().unwrap_err()).contains("must be > 0"));
+
+        let mut cfg = split_cfg();
+        cfg.split_max_parts = 0;
+        assert!(format!("{}", cfg.validate().unwrap_err()).contains("split-max-parts"));
+    }
+
+    #[test]
+    fn split_copy_rejects_schema_only_dump() {
+        let mut cfg = split_cfg();
+        cfg.dump_scope = DumpScope::SchemaOnly;
+        assert!(format!("{}", cfg.validate().unwrap_err()).contains("schema-only"));
+    }
+
+    /// The planner queries the catalog directly instead of reimplementing
+    /// pg_dump's pattern grammar, so any filter could put the two out of
+    /// step — excluding a table's data from the archive while still copying
+    /// it directly, or the reverse.
+    #[test]
+    fn split_copy_rejects_every_table_filter() {
+        for mutate in [
+            (|c: &mut MigrationConfig| c.schemas = vec!["app".into()]) as fn(&mut MigrationConfig),
+            |c: &mut MigrationConfig| c.tables = vec!["app.t".into()],
+            |c: &mut MigrationConfig| c.exclude_schemas = vec!["audit".into()],
+            |c: &mut MigrationConfig| c.exclude_tables = vec!["app.big".into()],
+        ] {
+            let mut cfg = split_cfg();
+            mutate(&mut cfg);
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                format!("{err}").contains("pattern matching"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// An exported snapshot dies with the process that exported it, so a
+    /// resumed run cannot read the split tables at the same instant as the
+    /// archive it is resuming into.
+    #[test]
+    fn split_copy_rejects_resume() {
+        let mut cfg = split_cfg();
+        cfg.resume = true;
+        cfg.dump_path = Some(std::path::PathBuf::from("/tmp/dump"));
+        assert!(format!("{}", cfg.validate().unwrap_err()).contains("--resume"));
+    }
+
+    /// The all-in-one restore has already built indexes and foreign keys by
+    /// the time the copy would run, so TRUNCATE fails outright on an
+    /// FK-referenced table and the load would fire user triggers.
+    #[test]
+    fn split_copy_requires_split_sections() {
+        let mut cfg = split_cfg();
+        cfg.split_sections = false;
+        assert!(format!("{}", cfg.validate().unwrap_err()).contains("split-section"));
     }
 }
