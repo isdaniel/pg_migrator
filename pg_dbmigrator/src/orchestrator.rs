@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
@@ -12,6 +13,9 @@ use tracing::info;
 
 use crate::analyze::{maybe_analyze_target, maybe_vacuum_source};
 use crate::config::{MigrationConfig, MigrationMode, VerifyMode};
+use crate::copy_split::{
+    export_snapshot, plan_split_tables, run_split_copy, ExportedSnapshot, SplitTable,
+};
 use crate::cutover::CutoverHandle;
 use crate::dump::{run_pg_dump, CommandRunner, DumpFormat, DumpRequest, TokioCommandRunner};
 use crate::error::{MigrationError, Result};
@@ -25,7 +29,7 @@ use crate::preflight::{
     verify_publication_exists,
 };
 use crate::progress::{MigrationStage, ProgressEvent, ProgressReporter, TracingReporter};
-use crate::restore::{run_pg_restore, run_pg_restore_in_sections, RestoreRequest};
+use crate::restore::{run_pg_restore, RestoreRequest, RestoreSection, RESTORE_SECTIONS};
 use crate::resume::{default_resume_path, CompletedStage, ResumeToken};
 use crate::sequences::sync_sequences;
 use crate::snapshot::prepare_replication_slot;
@@ -154,17 +158,29 @@ impl Migrator {
 
         self.run_source_vacuum_stage(&mut token, &dump_path).await;
 
+        // Offline has no replication slot, so if the split copy is enabled we
+        // export our own snapshot and hand the same id to pg_dump. Held for
+        // the whole run: the directly-copied tables must agree with the
+        // archived ones about which rows exist.
+        let split = self.prepare_split(None).await?;
+
         if !token.has(CompletedStage::Dump) {
             self.report(MigrationStage::Dump, "starting pg_dump").await;
+            let started = Instant::now();
             run_pg_dump(
                 self.runner.as_ref(),
-                &self.dump_request(&dump_path, None),
+                &self.dump_request(
+                    &dump_path,
+                    split.as_ref().map(|s| s.snapshot_id.clone()),
+                    split.as_ref(),
+                ),
                 &cancel,
             )
             .await?;
             if cancel.is_cancelled() {
                 return Err(MigrationError::Cancelled);
             }
+            self.report_dump_elapsed(started).await;
             token.mark(CompletedStage::Dump);
             self.save_resume(&token, &dump_path).await;
         } else {
@@ -178,7 +194,7 @@ impl Migrator {
         if !token.has(CompletedStage::Restore) {
             self.report(MigrationStage::Restore, "starting pg_restore")
                 .await;
-            self.restore(&dump_path, &cancel).await?;
+            self.restore(&dump_path, &cancel, split.as_ref()).await?;
             token.mark(CompletedStage::Restore);
             self.save_resume(&token, &dump_path).await;
         } else {
@@ -296,6 +312,10 @@ impl Migrator {
         };
 
         // 2. Snapshot-aligned dump.
+        // The slot already exported a snapshot, so the split copy reuses it
+        // rather than exporting a second one.
+        let split = self.prepare_split(snapshot_name.clone()).await?;
+
         if !token.has(CompletedStage::Dump) {
             self.report(
                 MigrationStage::Dump,
@@ -305,15 +325,17 @@ impl Migrator {
                 ),
             )
             .await;
+            let started = Instant::now();
             run_pg_dump(
                 self.runner.as_ref(),
-                &self.dump_request(&dump_path, snapshot_name.clone()),
+                &self.dump_request(&dump_path, snapshot_name.clone(), split.as_ref()),
                 &cancel,
             )
             .await?;
             if cancel.is_cancelled() {
                 return Err(MigrationError::Cancelled);
             }
+            self.report_dump_elapsed(started).await;
             token.mark(CompletedStage::Dump);
             self.save_resume(&token, &dump_path).await;
         } else {
@@ -328,7 +350,7 @@ impl Migrator {
         if !token.has(CompletedStage::Restore) {
             self.report(MigrationStage::Restore, "starting pg_restore")
                 .await;
-            self.restore(&dump_path, &cancel).await?;
+            self.restore(&dump_path, &cancel, split.as_ref()).await?;
             if cancel.is_cancelled() {
                 return Err(MigrationError::Cancelled);
             }
@@ -494,7 +516,85 @@ impl Migrator {
         .await
     }
 
-    fn dump_request(&self, dump_path: &Path, snapshot: Option<String>) -> DumpRequest {
+    /// Resolve the split-copy plan for this run, or `None` when the feature
+    /// is off.
+    ///
+    /// `existing_snapshot` is the id already exported by the replication
+    /// slot (online mode). Offline mode passes `None` and gets a freshly
+    /// exported one, held open by the returned context.
+    async fn prepare_split(
+        &self,
+        existing_snapshot: Option<String>,
+    ) -> Result<Option<SplitContext>> {
+        let Some(threshold) = self.config.split_tables_larger_than else {
+            return Ok(None);
+        };
+
+        let plan = plan_split_tables(
+            &self.config.source.connection_string,
+            threshold,
+            self.config.split_max_parts,
+        )
+        .await?;
+        if plan.is_empty() {
+            self.report(
+                MigrationStage::Dump,
+                format!(
+                    "no table reaches the {threshold}-byte split threshold; \
+                         using the normal dump path"
+                ),
+            )
+            .await;
+            return Ok(None);
+        }
+
+        // Online mode reuses the slot's snapshot. If the slot was reused and
+        // PostgreSQL exported nothing, there is no consistent point to copy
+        // from — refuse rather than silently copy from a different instant
+        // than the archive.
+        let (snapshot_id, held) = match existing_snapshot {
+            Some(id) => (id, None),
+            None if self.config.mode == MigrationMode::Online => {
+                return Err(MigrationError::config(
+                    "--split-tables-larger-than needs an exported snapshot, but the \
+                     replication slot did not provide one (it was reused from a \
+                     previous run). Drop the slot, or run without the split option.",
+                ))
+            }
+            None => {
+                let held = export_snapshot(&self.config.source.connection_string).await?;
+                (held.id.clone(), Some(held))
+            }
+        };
+
+        let total: i64 = plan.iter().map(|t| t.bytes).sum();
+        self.report_detail(
+            MigrationStage::Dump,
+            format!(
+                "{} table(s) will be copied directly, bypassing the archive",
+                plan.len()
+            ),
+            serde_json::json!({
+                "tables": plan.iter().map(|t| t.table.as_str()).collect::<Vec<_>>(),
+                "bytes": total,
+                "parts_per_table": self.config.split_max_parts,
+            }),
+        )
+        .await;
+
+        Ok(Some(SplitContext {
+            plan,
+            snapshot_id,
+            _held: held,
+        }))
+    }
+
+    fn dump_request(
+        &self,
+        dump_path: &Path,
+        snapshot: Option<String>,
+        split: Option<&SplitContext>,
+    ) -> DumpRequest {
         // Custom format dump → fastest pg_restore; directory format if user
         // has asked for >1 jobs. We default to Custom to avoid surprising the
         // operator with a directory archive.
@@ -512,6 +612,9 @@ impl Migrator {
             tables: self.config.tables.clone(),
             exclude_schemas: self.config.exclude_schemas.clone(),
             exclude_tables: self.config.exclude_tables.clone(),
+            exclude_table_data: split
+                .map(|s| s.plan.iter().map(|t| t.table.clone()).collect())
+                .unwrap_or_default(),
             output_path: dump_path.to_path_buf(),
             format,
             no_publications: self.config.no_publications,
@@ -540,13 +643,85 @@ impl Migrator {
     /// Issue `pg_restore` either as a single all-in-one call or, when
     /// `split_sections` is enabled, as three section-restricted calls
     /// (pre-data → data → post-data).
-    async fn restore(&self, dump_path: &Path, cancel: &CancellationToken) -> Result<()> {
-        let req = self.restore_request(dump_path);
-        if self.config.split_sections {
-            run_pg_restore_in_sections(self.runner.as_ref(), &req, cancel).await
-        } else {
-            run_pg_restore(self.runner.as_ref(), &req, cancel).await
+    ///
+    /// The split path reports each section separately. On a large table the
+    /// data phase and the post-data phase (index builds) can differ by an
+    /// order of magnitude, and an operator deciding where to spend tuning
+    /// effort cannot see that from a single aggregate `Restore` event.
+    async fn restore(
+        &self,
+        dump_path: &Path,
+        cancel: &CancellationToken,
+        split: Option<&SplitContext>,
+    ) -> Result<()> {
+        let base = self.restore_request(dump_path);
+        if !self.config.split_sections {
+            run_pg_restore(self.runner.as_ref(), &base, cancel).await?;
+            return self.run_split_copy_stage(split, cancel).await;
         }
+        for section in RESTORE_SECTIONS {
+            if cancel.is_cancelled() {
+                return Err(MigrationError::Cancelled);
+            }
+            let mut req = base.clone();
+            req.section = Some(section);
+            // Keep emitting the same line `run_pg_restore_in_sections` did:
+            // it is the section-ordering contract the integration suite
+            // asserts on, and moving the loop here must not change it.
+            info!(?section, "running pg_restore section");
+            let started = Instant::now();
+            run_pg_restore(self.runner.as_ref(), &req, cancel).await?;
+            self.report_detail(
+                MigrationStage::Restore,
+                format!("section {} complete", section.flag()),
+                serde_json::json!({
+                    "section": section.flag(),
+                    "elapsed_secs": started.elapsed().as_secs_f64(),
+                }),
+            )
+            .await;
+            // The split tables' rows are not in the archive. Move them once
+            // the archive's own data is in and before post-data starts
+            // building indexes over them.
+            if section == RestoreSection::Data {
+                self.run_split_copy_stage(split, cancel).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream the split tables straight from source to target. No-op when
+    /// the feature is off.
+    async fn run_split_copy_stage(
+        &self,
+        split: Option<&SplitContext>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let Some(split) = split else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let rows = run_split_copy(
+            &self.config.source.connection_string,
+            &self.config.target.connection_string,
+            &split.snapshot_id,
+            &split.plan,
+            self.config.drop_target_first,
+            cancel,
+        )
+        .await?;
+        self.report_detail(
+            MigrationStage::Restore,
+            format!("split copy complete ({rows} rows)"),
+            serde_json::json!({
+                "section": "split-copy",
+                "rows": rows,
+                "tables": split.plan.len(),
+                "elapsed_secs": started.elapsed().as_secs_f64(),
+            }),
+        )
+        .await;
+        Ok(())
     }
 
     fn dump_path_or_default(&self, prefix: &str) -> PathBuf {
@@ -691,6 +866,47 @@ impl Migrator {
             .report(ProgressEvent::new(stage, message.into()))
             .await;
     }
+
+    async fn report_detail(
+        &self,
+        stage: MigrationStage,
+        message: impl Into<String>,
+        detail: serde_json::Value,
+    ) {
+        self.reporter
+            .report(ProgressEvent::new(stage, message.into()).with_detail(detail))
+            .await;
+    }
+
+    /// Emit the wall time of the dump so it can be compared against the
+    /// per-section restore timings from [`Self::restore`]. Together they
+    /// answer "is this migration bound by moving data or by rebuilding
+    /// indexes", which is the first question when tuning a large run.
+    async fn report_dump_elapsed(&self, started: Instant) {
+        self.report_detail(
+            MigrationStage::Dump,
+            "pg_dump complete",
+            serde_json::json!({ "elapsed_secs": started.elapsed().as_secs_f64() }),
+        )
+        .await;
+    }
+}
+
+/// Everything the split-copy path needs, resolved once per run.
+///
+/// Constructed by `Migrator::prepare_split` and threaded through the dump
+/// (which must exclude these tables' data) and the restore (which must
+/// supply it directly instead).
+#[allow(missing_debug_implementations)]
+struct SplitContext {
+    /// Tables selected for direct copying, with their page ranges.
+    plan: Vec<SplitTable>,
+    /// Snapshot every stream reads from, shared with `pg_dump`.
+    snapshot_id: String,
+    /// Offline runs hold their own exported snapshot here; dropping this
+    /// ends the exporting transaction, so it must outlive the copy. Online
+    /// runs leave it `None` — the replication slot owns the snapshot.
+    _held: Option<ExportedSnapshot>,
 }
 
 /// Aggregate result of a single migration run.
@@ -840,6 +1056,42 @@ mod tests {
         assert!(stages.contains(&MigrationStage::Complete));
     }
 
+    /// The point of the per-section events is that an operator can read
+    /// "data took X, post-data took Y" out of the `--json` stream. Assert
+    /// the payload shape, not just that some event was emitted.
+    #[tokio::test]
+    async fn split_section_restore_reports_elapsed_per_section() {
+        let reporter = Arc::new(CollectingReporter::new());
+        let migrator = Migrator::new(MigrationConfig {
+            split_sections: true,
+            ..baseline_config()
+        })
+        .with_runner(Arc::new(RecordingRunner::default()))
+        .with_reporter(reporter.clone())
+        .with_dump_path(PathBuf::from("/tmp/pg_dbmigrator_test_sections"));
+
+        migrator
+            .run_offline(CancellationToken::new())
+            .await
+            .expect("offline migration should succeed");
+
+        let sections: Vec<String> = reporter
+            .events()
+            .await
+            .into_iter()
+            .filter(|e| e.stage == MigrationStage::Restore)
+            .filter_map(|e| e.detail)
+            .map(|d| {
+                assert!(
+                    d["elapsed_secs"].is_number(),
+                    "section event must carry elapsed_secs: {d}"
+                );
+                d["section"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(sections, ["pre-data", "data", "post-data"]);
+    }
+
     #[tokio::test]
     async fn offline_run_with_split_sections_invokes_pg_restore_three_times() {
         let runner = Arc::new(RecordingRunner::default());
@@ -944,7 +1196,7 @@ mod tests {
             ..baseline_config()
         };
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        let req = m.dump_request(Path::new("/tmp/dump"), None, None);
         assert_eq!(req.format, DumpFormat::Directory);
     }
 
@@ -955,7 +1207,7 @@ mod tests {
             ..baseline_config()
         };
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        let req = m.dump_request(Path::new("/tmp/dump"), None, None);
         assert_eq!(req.format, DumpFormat::Custom);
     }
 
@@ -970,7 +1222,7 @@ mod tests {
             ..baseline_config()
         };
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        let req = m.dump_request(Path::new("/tmp/dump"), None, None);
         assert_eq!(req.compress.as_deref(), Some("zstd:3"));
         assert!(req.no_sync);
         assert!(req.no_comments);
@@ -1112,7 +1364,7 @@ mod tests {
             ..baseline_config()
         };
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        let req = m.dump_request(Path::new("/tmp/dump"), None, None);
         assert_eq!(req.exclude_schemas, vec!["audit", "temp"]);
         assert_eq!(req.exclude_tables, vec!["public.large"]);
     }
@@ -1121,7 +1373,11 @@ mod tests {
     fn dump_request_propagates_snapshot() {
         let cfg = baseline_config();
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), Some("00000003-deadbeef-1".into()));
+        let req = m.dump_request(
+            Path::new("/tmp/dump"),
+            Some("00000003-deadbeef-1".into()),
+            None,
+        );
         assert_eq!(req.snapshot.as_deref(), Some("00000003-deadbeef-1"));
     }
 
@@ -1225,7 +1481,7 @@ mod tests {
     fn dump_request_passes_none_snapshot_when_not_provided() {
         let cfg = baseline_config();
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        let req = m.dump_request(Path::new("/tmp/dump"), None, None);
         assert!(req.snapshot.is_none());
     }
 
@@ -1237,7 +1493,7 @@ mod tests {
             ..baseline_config()
         };
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        let req = m.dump_request(Path::new("/tmp/dump"), None, None);
         assert_eq!(req.schemas, vec!["public", "app"]);
         assert_eq!(req.tables, vec!["public.users"]);
     }
@@ -1250,7 +1506,7 @@ mod tests {
             ..baseline_config()
         };
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        let req = m.dump_request(Path::new("/tmp/dump"), None, None);
         assert_eq!(req.scope, DumpScope::SchemaOnly);
     }
 
@@ -1339,7 +1595,7 @@ mod tests {
             ..baseline_config()
         };
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        let req = m.dump_request(Path::new("/tmp/dump"), None, None);
         assert!(!req.no_publications);
         assert!(!req.no_subscriptions);
     }
@@ -1348,7 +1604,7 @@ mod tests {
     fn dump_request_defaults_have_no_publications_true() {
         let cfg = baseline_config();
         let m = Migrator::new(cfg);
-        let req = m.dump_request(Path::new("/tmp/dump"), None);
+        let req = m.dump_request(Path::new("/tmp/dump"), None, None);
         assert!(req.no_publications);
         assert!(req.no_subscriptions);
     }

@@ -395,6 +395,18 @@ fn is_restore_partial_failure(err: &MigrationError) -> bool {
     )
 }
 
+/// Canonical order for a split-section restore: schema, then table data,
+/// then indexes and constraints.
+///
+/// Shared with [`crate::orchestrator`], which runs the same sequence but
+/// emits a progress event per section, so the order lives in exactly one
+/// place.
+pub const RESTORE_SECTIONS: [RestoreSection; 3] = [
+    RestoreSection::PreData,
+    RestoreSection::Data,
+    RestoreSection::PostData,
+];
+
 /// Run `pg_restore` three times — `--section=pre-data`, then `data`, then
 /// `post-data`.
 ///
@@ -412,11 +424,7 @@ pub async fn run_pg_restore_in_sections<R: CommandRunner + ?Sized>(
     base_req: &RestoreRequest,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    for section in [
-        RestoreSection::PreData,
-        RestoreSection::Data,
-        RestoreSection::PostData,
-    ] {
+    for section in RESTORE_SECTIONS {
         if cancel.is_cancelled() {
             return Err(MigrationError::Cancelled);
         }
@@ -427,7 +435,6 @@ pub async fn run_pg_restore_in_sections<R: CommandRunner + ?Sized>(
     }
     Ok(())
 }
-
 /// Convenience helper: run a plain SQL file through `psql` (used when the
 /// dump format is [`crate::dump::DumpFormat::Plain`]).
 pub async fn run_psql_file<R: CommandRunner + ?Sized>(
